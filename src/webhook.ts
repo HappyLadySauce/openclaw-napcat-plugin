@@ -1,3 +1,5 @@
+import { Agent as HttpAgent, request as httpRequest } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createReadStream } from "node:fs";
 import { appendFile, mkdir, stat } from "node:fs/promises";
@@ -11,12 +13,72 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const napcatHttpAgent = new HttpAgent({
+    keepAlive: true,
+    keepAliveMsecs: 10000,
+    maxSockets: 20,
+    maxFreeSockets: 10,
+});
+
+const napcatHttpsAgent = new HttpsAgent({
+    keepAlive: true,
+    keepAliveMsecs: 10000,
+    maxSockets: 20,
+    maxFreeSockets: 10,
+});
+
 function isRetryableNapCatError(err: any): boolean {
     const code = String(err?.cause?.code || err?.code || "");
-    return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET"].includes(code);
+    return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "ECONNABORTED"].includes(code);
 }
 
-// Simple function to send message via NapCat API (with retry for transient socket errors)
+async function postJsonWithNodeHttp(url: string, payload: any, timeoutMs: number): Promise<{ statusCode: number; statusText: string; bodyText: string }> {
+    const target = new URL(url);
+    const isHttps = target.protocol === "https:";
+    const body = JSON.stringify(payload);
+    const transport = isHttps ? httpsRequest : httpRequest;
+    const agent = isHttps ? napcatHttpsAgent : napcatHttpAgent;
+
+    return new Promise((resolve, reject) => {
+        const req = transport(
+            {
+                protocol: target.protocol,
+                hostname: target.hostname,
+                port: target.port || (isHttps ? 443 : 80),
+                path: `${target.pathname}${target.search}`,
+                method: "POST",
+                agent,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Content-Length": Buffer.byteLength(body),
+                    "Connection": "keep-alive",
+                },
+            },
+            (res) => {
+                const chunks: Buffer[] = [];
+                res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+                res.on("end", () => {
+                    const bodyText = Buffer.concat(chunks).toString("utf8");
+                    resolve({
+                        statusCode: res.statusCode || 0,
+                        statusText: res.statusMessage || "",
+                        bodyText,
+                    });
+                });
+            }
+        );
+
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(Object.assign(new Error(`NapCat request timeout after ${timeoutMs}ms`), { code: "ETIMEDOUT" }));
+        });
+
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+    });
+}
+
+// Send message via NapCat API (node http/https keep-alive + retry for transient socket errors)
 async function sendToNapCat(url: string, payload: any) {
     const maxAttempts = 3;
     const timeoutsMs = [5000, 7000, 9000];
@@ -25,24 +87,17 @@ async function sendToNapCat(url: string, payload: any) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             const timeoutMs = timeoutsMs[Math.min(attempt - 1, timeoutsMs.length - 1)];
-            const res = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-                signal: AbortSignal.timeout(timeoutMs),
-            });
+            const res = await postJsonWithNodeHttp(url, payload, timeoutMs);
 
-            if (!res.ok) {
-                const bodyText = await res.text().catch(() => "");
-                throw new Error(`NapCat API Error: ${res.status} ${res.statusText}${bodyText ? ` | ${bodyText.slice(0, 300)}` : ""}`);
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                throw new Error(`NapCat API Error: ${res.statusCode} ${res.statusText}${res.bodyText ? ` | ${res.bodyText.slice(0, 300)}` : ""}`);
             }
 
-            const text = await res.text();
-            if (!text) return { status: "ok" };
+            if (!res.bodyText) return { status: "ok" };
             try {
-                return JSON.parse(text);
+                return JSON.parse(res.bodyText);
             } catch {
-                return { status: "ok", raw: text };
+                return { status: "ok", raw: res.bodyText };
             }
         } catch (err: any) {
             lastErr = err;
