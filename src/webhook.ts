@@ -5,6 +5,7 @@ import { createReadStream } from "node:fs";
 import { appendFile, mkdir, stat } from "node:fs/promises";
 import { dirname, extname, resolve } from "node:path";
 import { getNapCatRuntime, getNapCatConfig } from "./runtime.js";
+import { isWsTransport, sendNapCatActionOverWs } from "./ws.js";
 
 // Group name cache removed
 
@@ -146,6 +147,19 @@ async function sendToNapCat(url: string, payload: any) {
     }
 
     throw lastErr;
+}
+
+function endpointToAction(endpoint: string): string {
+    return endpoint.replace(/^\/+/, "").trim();
+}
+
+async function sendNapCatByTransport(config: any, endpoint: string, payload: any) {
+    if (isWsTransport(config)) {
+        const action = endpointToAction(endpoint);
+        return sendNapCatActionOverWs(action, payload, Number(config.wsRequestTimeoutMs || 10000));
+    }
+    const baseUrl = config.url || "http://127.0.0.1:3000";
+    return sendToNapCat(`${baseUrl}${endpoint}`, payload);
 }
 
 function buildMediaProxyUrl(mediaUrl: string, config: any): string {
@@ -381,6 +395,232 @@ function extractNapCatEvents(body: any): any[] {
     return [];
 }
 
+export async function handleNapCatInboundBody(body: any): Promise<void> {
+    const config = getNapCatConfig();
+    const events = extractNapCatEvents(body);
+
+    try {
+        if (body?.__parseError && typeof body.__raw === "string" && body.__raw.trim()) {
+            await logInboundParseFailure(body.__raw, config);
+        }
+        for (const event of events) {
+            await logInboundMessage(event, config);
+        }
+    } catch (err) {
+        console.error("[NapCat] Failed to write inbound log:", err);
+    }
+
+    const event = events[0] || body;
+
+    if (event.post_type === "meta_event") return;
+    if (event.post_type !== "message") return;
+
+    const runtime = getNapCatRuntime();
+    const isGroup = event.message_type === "group";
+    const senderId = String(event.user_id);
+    if (!/^\d+$/.test(senderId)) {
+        console.warn(`[NapCat] WARNING: user_id is not numeric: ${senderId}`);
+    }
+    const rawText = event.raw_message || "";
+    let text = rawText;
+
+    const allowUsers = config.allowUsers || [];
+    const isAllowUser = allowUsers.includes(senderId);
+    if (allowUsers.length > 0 && !isAllowUser) {
+        console.log(`[NapCat] Ignoring message from ${senderId} (not in allowlist)`);
+        return;
+    }
+
+    const enableGroupMessages = config.enableGroupMessages || false;
+    const groupMentionOnly = config.groupMentionOnly !== false;
+    let wasMentioned = !isGroup;
+
+    if (isGroup) {
+        if (!enableGroupMessages) {
+            console.log(`[NapCat] Ignoring group message (group messages disabled)`);
+            return;
+        }
+
+        const botId = event.self_id || config.selfId;
+        if (groupMentionOnly) {
+            if (!botId) {
+                console.log(`[NapCat] Cannot determine bot ID, ignoring group message`);
+                return;
+            }
+            const mentionPatternCQ = new RegExp(`\\[CQ:at,qq=${botId}\\]`, "i");
+            const allMentionPatternCQ = /\[CQ:at,qq=all\]/i;
+            const mentionPatternPlain1 = new RegExp(`@[^\\s]+ \\(${botId}\\)`, "i");
+            const mentionPatternPlain2 = new RegExp(`@${botId}(?:\\s|$|,)`, "i");
+            const isMentionedCQ = mentionPatternCQ.test(text) || allMentionPatternCQ.test(text);
+            const isMentionedPlain = mentionPatternPlain1.test(text) || mentionPatternPlain2.test(text);
+            if (!isMentionedCQ && !isMentionedPlain) {
+                console.log(`[NapCat] Ignoring group message (bot not mentioned)`);
+                return;
+            }
+            wasMentioned = true;
+            console.log(`[NapCat] Bot mentioned in group, processing message`);
+        } else if (botId) {
+            const mentionPatternCQ = new RegExp(`\\[CQ:at,qq=${botId}\\]`, "i");
+            const allMentionPatternCQ = /\[CQ:at,qq=all\]/i;
+            const mentionPatternPlain1 = new RegExp(`@[^\\s]+ \\(${botId}\\)`, "i");
+            const mentionPatternPlain2 = new RegExp(`@${botId}(?:\\s|$|,)`, "i");
+            wasMentioned = mentionPatternCQ.test(text) || allMentionPatternCQ.test(text) ||
+                mentionPatternPlain1.test(text) || mentionPatternPlain2.test(text);
+        }
+
+        if (botId) {
+            const stripCQ = new RegExp(`^\\[CQ:at,qq=${botId}\\]\\s*`, "i");
+            const stripAll = /^\[CQ:at,qq=all\]\s*/i;
+            const stripPlain1 = new RegExp(`^@[^\\s]+ \\(${botId}\\)\\s*`, "i");
+            const stripPlain2 = new RegExp(`^@${botId}(?:\\s|$|,)\\s*`, "i");
+            text = text.replace(stripCQ, "").replace(stripAll, "").replace(stripPlain1, "").replace(stripPlain2, "").trim();
+        }
+    }
+
+    const messageId = String(event.message_id);
+    const conversationId = isGroup ? `group:${event.group_id}` : `private:${senderId}`;
+    const senderName = event.sender?.nickname || senderId;
+    const baseSessionKey = isGroup ? `session:napcat:group:${event.group_id}` : `session:napcat:private:${senderId}`;
+    const cfg = runtime.config?.loadConfig?.() || {};
+    const route = await runtime.channel.routing.resolveAgentRoute({
+        channel: "napcat",
+        conversationId,
+        senderId,
+        text,
+        cfg,
+        ctx: {},
+    });
+
+    if (!route?.agentId) {
+        console.log("[NapCat] No route found for message, ignoring");
+        return;
+    }
+
+    const configuredAgentId = String(config.agentId || "").trim().toLowerCase();
+    const routeAgentId = String(route.agentId || "").trim().toLowerCase();
+    const effectiveAgentId = configuredAgentId || routeAgentId || "main";
+    const sessionKey = `agent:${effectiveAgentId}:${baseSessionKey}`;
+    const sessionDisplayName = sessionKey;
+
+    console.log(`[NapCat] Inbound from ${senderId} (session: ${sessionKey}): ${text.substring(0, 50)}...`);
+    if (configuredAgentId && configuredAgentId !== routeAgentId) {
+        console.log(`[NapCat] Override route agent by config: ${routeAgentId || "none"} -> ${configuredAgentId}`);
+    }
+
+    route.agentId = effectiveAgentId;
+    route.sessionKey = sessionKey;
+
+    const ctxPayload = {
+        Body: text,
+        RawBody: rawText,
+        CommandBody: text,
+        From: `napcat:${conversationId}`,
+        To: "me",
+        SessionKey: sessionKey,
+        SessionDisplayName: sessionDisplayName,
+        displayName: sessionDisplayName,
+        name: sessionDisplayName,
+        Title: sessionDisplayName,
+        ConversationTitle: sessionDisplayName,
+        Topic: sessionDisplayName,
+        Subject: sessionDisplayName,
+        AccountId: route.accountId,
+        ChatType: isGroup ? "group" : "direct",
+        ConversationLabel: sessionKey,
+        SenderName: senderName,
+        SenderId: senderId,
+        Provider: "napcat",
+        Surface: "napcat",
+        MessageSid: messageId,
+        WasMentioned: wasMentioned,
+        CommandAuthorized: true,
+        OriginatingChannel: "napcat",
+        OriginatingTo: conversationId,
+    };
+
+    let dispatcher = null;
+    if (runtime.channel.reply.createReplyDispatcherWithTyping) {
+        console.log("[NapCat] Calling createReplyDispatcherWithTyping...");
+        const result = await runtime.channel.reply.createReplyDispatcherWithTyping({
+            responsePrefix: "",
+            responsePrefixContextProvider: () => ({}),
+            humanDelay: 0,
+            deliver: async (payload: any) => {
+                console.log("[NapCat] Reply to deliver:", JSON.stringify(payload).substring(0, 100));
+                const currentConfig = getNapCatConfig();
+                const isGroupReply = conversationId.startsWith("group:");
+                const targetId = isGroupReply ? conversationId.replace("group:", "") : conversationId.replace("private:", "");
+                const endpoint = isGroupReply ? "/send_group_msg" : "/send_private_msg";
+                const message = buildNapCatMessageFromReply(payload, currentConfig);
+                if (!message) {
+                    console.log("[NapCat] Skip empty reply payload");
+                    return;
+                }
+                const msgPayload: any = { message };
+                if (isGroupReply) msgPayload.group_id = targetId;
+                else msgPayload.user_id = targetId;
+                console.log(`[NapCat] Sending reply to ${isGroupReply ? "group" : "private"} ${targetId}: ${message.substring(0, 50)}...`);
+                try {
+                    await sendNapCatByTransport(currentConfig, endpoint, msgPayload);
+                    console.log("[NapCat] Reply sent successfully");
+                } catch (err) {
+                    console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
+                }
+            },
+            onError: (err: any, info: any) => {
+                console.error(`[NapCat] Reply error (${info.kind}):`, err);
+            },
+            onReplyStart: () => {},
+            onIdle: () => {},
+        });
+        dispatcher = result.dispatcher;
+    } else if (runtime.channel.reply.createReplyDispatcher) {
+        dispatcher = runtime.channel.reply.createReplyDispatcher({
+            responsePrefix: "",
+            responsePrefixContextProvider: () => ({}),
+            humanDelay: 0,
+            deliver: async (payload: any) => {
+                console.log("[NapCat] Reply to deliver:", JSON.stringify(payload).substring(0, 100));
+                const currentConfig = getNapCatConfig();
+                const isGroupReply = conversationId.startsWith("group:");
+                const targetId = isGroupReply ? conversationId.replace("group:", "") : conversationId.replace("private:", "");
+                const endpoint = isGroupReply ? "/send_group_msg" : "/send_private_msg";
+                const message = buildNapCatMessageFromReply(payload, currentConfig);
+                if (!message) {
+                    console.log("[NapCat] Skip empty reply payload");
+                    return;
+                }
+                const msgPayload: any = { message };
+                if (isGroupReply) msgPayload.group_id = targetId;
+                else msgPayload.user_id = targetId;
+                console.log(`[NapCat] Sending reply to ${isGroupReply ? "group" : "private"} ${targetId}: ${message.substring(0, 50)}...`);
+                try {
+                    await sendNapCatByTransport(currentConfig, endpoint, msgPayload);
+                    console.log("[NapCat] Reply sent successfully");
+                } catch (err) {
+                    console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
+                }
+            },
+            onError: (err: any, info: any) => {
+                console.error(`[NapCat] Reply error (${info.kind}):`, err);
+            },
+        });
+    }
+
+    if (!dispatcher) {
+        console.error("[NapCat] Could not create dispatcher");
+        return;
+    }
+
+    console.log("[NapCat] Dispatcher created, methods:", Object.keys(dispatcher));
+    await runtime.channel.reply.dispatchReplyFromConfig({
+        ctx: ctxPayload,
+        cfg,
+        dispatcher,
+        replyOptions: {},
+    });
+}
+
 export async function handleNapCatWebhook(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     const url = req.url || "";
     const method = req.method || "UNKNOWN";
@@ -404,314 +644,7 @@ export async function handleNapCatWebhook(req: IncomingMessage, res: ServerRespo
 
     try {
         const body = await readBody(req);
-        const config = getNapCatConfig();
-        const events = extractNapCatEvents(body);
-
-        try {
-            if (body?.__parseError && typeof body.__raw === "string" && body.__raw.trim()) {
-                await logInboundParseFailure(body.__raw, config);
-            }
-            for (const event of events) {
-                await logInboundMessage(event, config);
-            }
-        } catch (err) {
-            console.error("[NapCat] Failed to write inbound log:", err);
-        }
-
-        const event = events[0] || body;
-
-        // Heartbeat / Lifecycle
-        if (event.post_type === "meta_event") {
-            res.statusCode = 200;
-            res.setHeader("Content-Type", "application/json");
-            res.end('{"status":"ok"}');
-            return true;
-        }
-
-        if (event.post_type === "message") {
-            const runtime = getNapCatRuntime();
-            const isGroup = event.message_type === "group";
-            // Ensure senderId is numeric string
-            const senderId = String(event.user_id);
-            // Safety check: if senderId looks like a name (non-numeric), log warning
-            if (!/^\d+$/.test(senderId)) {
-                console.warn(`[NapCat] WARNING: user_id is not numeric: ${senderId}`);
-            }
-            const rawText = event.raw_message || "";
-            let text = rawText;
-
-            // Get allowUsers from config
-            const allowUsers = config.allowUsers || [];
-            const isAllowUser = allowUsers.includes(senderId);
-
-            // Check allowlist logic
-            // If allowUsers is configured, only listed users should trigger the bot.
-            // This applies to both DMs and Group chats.
-            if (allowUsers.length > 0 && !isAllowUser) {
-                console.log(`[NapCat] Ignoring message from ${senderId} (not in allowlist)`);
-                res.statusCode = 200;
-                res.setHeader("Content-Type", "application/json");
-                res.end('{"status":"ok"}');
-                return true;
-            }
-
-            // Group message handling
-            const enableGroupMessages = config.enableGroupMessages || false;
-            const groupMentionOnly = config.groupMentionOnly !== false; // Default true
-            let wasMentioned = !isGroup; // In DMs, we consider it "mentioned"
-
-            if (isGroup) {
-                if (!enableGroupMessages) {
-                    // Group messages disabled - ignore
-                    console.log(`[NapCat] Ignoring group message (group messages disabled)`);
-                    res.statusCode = 200;
-                    res.setHeader("Content-Type", "application/json");
-                    res.end('{"status":"ok"}');
-                    return true;
-                }
-
-                const botId = event.self_id || config.selfId;
-                if (groupMentionOnly) {
-                    // Check if bot was mentioned
-                    // NapCat sends self_id as the bot's QQ number
-                    if (!botId) {
-                        console.log(`[NapCat] Cannot determine bot ID, ignoring group message`);
-                        res.statusCode = 200;
-                        res.setHeader("Content-Type", "application/json");
-                        res.end('{"status":"ok"}');
-                        return true;
-                    }
-
-                    // Check for bot mention in raw_message
-                    // Support two formats:
-                    // 1. CQ code format: [CQ:at,qq={botId}] or [CQ:at,qq=all]
-                    // 2. Plain text format: @Nickname (botId) or @botId
-                    const mentionPatternCQ = new RegExp(`\\[CQ:at,qq=${botId}\\]`, 'i');
-                    const allMentionPatternCQ = /\[CQ:at,qq=all\]/i;
-                    
-                    // Plain text mention patterns: @xxx (123456) or @123456
-                    const mentionPatternPlain1 = new RegExp(`@[^\\s]+ \\(${botId}\\)`, 'i');
-                    const mentionPatternPlain2 = new RegExp(`@${botId}(?:\\s|$|,)`, 'i');
-
-                    const isMentionedCQ = mentionPatternCQ.test(text) || allMentionPatternCQ.test(text);
-                    const isMentionedPlain = mentionPatternPlain1.test(text) || mentionPatternPlain2.test(text);
-
-                    if (!isMentionedCQ && !isMentionedPlain) {
-                        console.log(`[NapCat] Ignoring group message (bot not mentioned)`);
-                        res.statusCode = 200;
-                        res.setHeader("Content-Type", "application/json");
-                        res.end('{"status":"ok"}');
-                        return true;
-                    }
-
-                    wasMentioned = true;
-                    console.log(`[NapCat] Bot mentioned in group, processing message`);
-                } else {
-                    // Check for mention anyway to update wasMentioned
-                    if (botId) {
-                        const mentionPatternCQ = new RegExp(`\\[CQ:at,qq=${botId}\\]`, 'i');
-                        const allMentionPatternCQ = /\[CQ:at,qq=all\]/i;
-                        const mentionPatternPlain1 = new RegExp(`@[^\\s]+ \\(${botId}\\)`, 'i');
-                        const mentionPatternPlain2 = new RegExp(`@${botId}(?:\\s|$|,)`, 'i');
-                        wasMentioned = mentionPatternCQ.test(text) || allMentionPatternCQ.test(text) || 
-                                       mentionPatternPlain1.test(text) || mentionPatternPlain2.test(text);
-                    }
-                }
-
-                // Strip mentions from text for cleaner processing and command detection
-                if (botId) {
-                    const stripCQ = new RegExp(`^\\[CQ:at,qq=${botId}\\]\\s*`, 'i');
-                    const stripAll = /^\[CQ:at,qq=all\]\s*/i;
-                    const stripPlain1 = new RegExp(`^@[^\\s]+ \\(${botId}\\)\\s*`, 'i');
-                    const stripPlain2 = new RegExp(`^@${botId}(?:\\s|$|,)\\s*`, 'i');
-                    text = text.replace(stripCQ, '').replace(stripAll, '').replace(stripPlain1, '').replace(stripPlain2, '').trim();
-                }
-            }
-
-            const messageId = String(event.message_id);
-            // OpenClaw convention: conversationId differentiates chats
-            // We prefix with type to help outbound routing
-            const conversationId = isGroup ? `group:${event.group_id}` : `private:${senderId}`;
-            const senderName = event.sender?.nickname || senderId;
-
-            // Generate NapCat base session key by conversation type
-            // Base format: session:napcat:private:{userId} or session:napcat:group:{groupId}
-            const baseSessionKey = isGroup 
-                ? `session:napcat:group:${event.group_id}`
-                : `session:napcat:private:${senderId}`;
-            const cfg = runtime.config?.loadConfig?.() || {};
-
-            // Resolve route for this message with specific session key
-            // Note: OpenClaw SDK ignores the sessionKey param, so we must override it after
-            const route = await runtime.channel.routing.resolveAgentRoute({
-                channel: "napcat",
-                conversationId,
-                senderId,
-                text,
-                cfg,
-                ctx: {},
-            });
-
-            if (!route?.agentId) {
-                console.log("[NapCat] No route found for message, ignoring");
-                res.statusCode = 200;
-                res.setHeader("Content-Type", "application/json");
-                res.end('{"status":"ok"}');
-                return true;
-            }
-
-            const configuredAgentId = String(config.agentId || "").trim().toLowerCase();
-            const routeAgentId = String(route.agentId || "").trim().toLowerCase();
-            const effectiveAgentId = configuredAgentId || routeAgentId || "main";
-            const sessionKey = `agent:${effectiveAgentId}:${baseSessionKey}`;
-
-            // User requested to use session key as display name for consistency
-            const sessionDisplayName = sessionKey;
-
-            // Log for debugging
-            console.log(`[NapCat] Inbound from ${senderId} (session: ${sessionKey}): ${text.substring(0, 50)}...`);
-            if (configuredAgentId && configuredAgentId !== routeAgentId) {
-                console.log(`[NapCat] Override route agent by config: ${routeAgentId || "none"} -> ${configuredAgentId}`);
-            }
-
-            // Force our custom session key and configured agent
-            route.agentId = effectiveAgentId;
-            route.sessionKey = sessionKey;
-
-            // Build ctxPayload using runtime methods
-            const ctxPayload = {
-                Body: text,
-                RawBody: rawText,
-                CommandBody: text,
-                From: `napcat:${conversationId}`,
-                To: "me",
-                SessionKey: sessionKey,  // Use our custom session key
-                SessionDisplayName: sessionDisplayName,
-                displayName: sessionDisplayName,
-                name: sessionDisplayName,
-                Title: sessionDisplayName,
-                ConversationTitle: sessionDisplayName,
-                Topic: sessionDisplayName,
-                Subject: sessionDisplayName,
-                AccountId: route.accountId,
-                ChatType: isGroup ? "group" : "direct",
-                ConversationLabel: sessionKey,
-                SenderName: senderName,
-                SenderId: senderId,
-                Provider: "napcat",
-                Surface: "napcat",
-                MessageSid: messageId,
-                WasMentioned: wasMentioned,
-                CommandAuthorized: true,
-                OriginatingChannel: "napcat",
-                OriginatingTo: conversationId,
-            };
-
-            // Create dispatcher for replies
-            let dispatcher = null;
-            
-            // Store conversationId for reply routing
-            const replyTarget = conversationId;
-            
-            if (runtime.channel.reply.createReplyDispatcherWithTyping) {
-                console.log("[NapCat] Calling createReplyDispatcherWithTyping...");
-                const result = await runtime.channel.reply.createReplyDispatcherWithTyping({
-                    responsePrefix: "",
-                    responsePrefixContextProvider: () => ({}),
-                    humanDelay: 0,
-                    deliver: async (payload) => {
-                        console.log("[NapCat] Reply to deliver:", JSON.stringify(payload).substring(0, 100));
-                        // Actually send the message via NapCat API
-                        const config = getNapCatConfig();
-                        const baseUrl = config.url || "http://127.0.0.1:3000";
-                        const isGroup = conversationId.startsWith("group:");
-                        const targetId = isGroup ? conversationId.replace("group:", "") : conversationId.replace("private:", "");
-                        const endpoint = isGroup ? "/send_group_msg" : "/send_private_msg";
-                        const message = buildNapCatMessageFromReply(payload, config);
-                        if (!message) {
-                            console.log("[NapCat] Skip empty reply payload");
-                            return;
-                        }
-                        const msgPayload = { message };
-                        if (isGroup) msgPayload.group_id = targetId;
-                        else msgPayload.user_id = targetId;
-                        
-                        console.log(`[NapCat] Sending reply to ${isGroup ? 'group' : 'private'} ${targetId}: ${message.substring(0, 50)}...`);
-                        try {
-                            await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload);
-                            console.log("[NapCat] Reply sent successfully");
-                        } catch (err) {
-                            console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
-                        }
-                    },
-                    onError: (err, info) => {
-                        console.error(`[NapCat] Reply error (${info.kind}):`, err);
-                    },
-                    onReplyStart: () => {},
-                    onIdle: () => {},
-                });
-                dispatcher = result.dispatcher;
-            } else if (runtime.channel.reply.createReplyDispatcher) {
-                dispatcher = runtime.channel.reply.createReplyDispatcher({
-                    responsePrefix: "",
-                    responsePrefixContextProvider: () => ({}),
-                    humanDelay: 0,
-                    deliver: async (payload) => {
-                        console.log("[NapCat] Reply to deliver:", JSON.stringify(payload).substring(0, 100));
-                        // Actually send the message via NapCat API
-                        const config = getNapCatConfig();
-                        const baseUrl = config.url || "http://127.0.0.1:3000";
-                        const isGroup = conversationId.startsWith("group:");
-                        const targetId = isGroup ? conversationId.replace("group:", "") : conversationId.replace("private:", "");
-                        const endpoint = isGroup ? "/send_group_msg" : "/send_private_msg";
-                        const message = buildNapCatMessageFromReply(payload, config);
-                        if (!message) {
-                            console.log("[NapCat] Skip empty reply payload");
-                            return;
-                        }
-                        const msgPayload = { message };
-                        if (isGroup) msgPayload.group_id = targetId;
-                        else msgPayload.user_id = targetId;
-                        
-                        console.log(`[NapCat] Sending reply to ${isGroup ? 'group' : 'private'} ${targetId}: ${message.substring(0, 50)}...`);
-                        try {
-                            await sendToNapCat(`${baseUrl}${endpoint}`, msgPayload);
-                            console.log("[NapCat] Reply sent successfully");
-                        } catch (err) {
-                            console.error("[NapCat] Reply delivery failed (suppressed to avoid channel crash):", err);
-                        }
-                    },
-                    onError: (err, info) => {
-                        console.error(`[NapCat] Reply error (${info.kind}):`, err);
-                    },
-                });
-            }
-
-            if (!dispatcher) {
-                console.error("[NapCat] Could not create dispatcher");
-                res.statusCode = 503;
-                res.setHeader("Content-Type", "application/json");
-                res.end('{"status":"error","message":"dispatcher creation failed"}');
-                return true;
-            }
-
-            console.log("[NapCat] Dispatcher created, methods:", Object.keys(dispatcher));
-
-            // Dispatch the message to OpenClaw
-            await runtime.channel.reply.dispatchReplyFromConfig({
-                ctx: ctxPayload,
-                cfg,
-                dispatcher,
-                replyOptions: {},
-            });
-            
-            res.statusCode = 200;
-            res.setHeader("Content-Type", "application/json");
-            res.end('{"status":"ok"}');
-            return true;
-        }
-
-        // Default OK for handled path
+        await handleNapCatInboundBody(body);
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");
         res.end('{"status":"ok"}');

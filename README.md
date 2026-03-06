@@ -36,7 +36,17 @@ git clone https://github.com/ProperSAMA/openclaw-napcat-plugin.git
     "napcat": {
       "enabled": true,
       "agentId": "main",
+      "transport": "http",
       "url": "http://127.0.0.1:3000",
+      "token": "napcat",
+      "wsUrl": "ws://127.0.0.1:3001/",
+      "wsHost": "0.0.0.0",
+      "wsPort": 3001,
+      "wsPath": "/",
+      "wsToken": "napcat",
+      "wsHeartbeatMs": 30000,
+      "wsReconnectMs": 30000,
+      "wsRequestTimeoutMs": 10000,
       "allowUsers": [
         "123456789",
         "987654321"
@@ -64,7 +74,17 @@ git clone https://github.com/ProperSAMA/openclaw-napcat-plugin.git
 
 | 配置项 | 类型 | 说明 | 默认值 |
 |--------|------|------|--------|
+| `transport` | string | 传输模式：`http` / `ws-client` / `ws-server` | `http` |
 | `url` | string | NapCat HTTP 服务地址 | `http://127.0.0.1:3000` |
+| `token` | string | NapCat HTTP 访问令牌（自动以 Bearer + access_token 发送） | `""` |
+| `wsUrl` | string | `ws-client` 模式连接地址（例如 `ws://127.0.0.1:3001/`） | `""` |
+| `wsHost` | string | `ws-server` 监听地址（也作为 `ws-client` 的回退 host） | `0.0.0.0` |
+| `wsPort` | number | `ws-server` 监听端口（也作为 `ws-client` 的回退 port） | `3001` |
+| `wsPath` | string | WS 路径（例如 `/`、`/onebot/v11/ws`） | `/` |
+| `wsToken` | string | WebSocket 鉴权令牌（Bearer + access_token） | `""` |
+| `wsHeartbeatMs` | number | WS 心跳间隔（毫秒） | `30000` |
+| `wsReconnectMs` | number | WS 重连间隔（毫秒，仅 `ws-client` 生效） | `30000` |
+| `wsRequestTimeoutMs` | number | WS action 请求超时（毫秒） | `10000` |
 | `agentId` | string | 可选，固定将 NapCat 会话绑定到该 OpenClaw agent（如 `main`、`ops`） | `""`（空=按默认路由） |
 | `allowUsers` | string[] | 允许接收消息的 QQ 用户 ID 列表 | `[]` (接收所有) |
 | `enableGroupMessages` | boolean | 是否处理群消息 | `false` |
@@ -79,7 +99,17 @@ git clone https://github.com/ProperSAMA/openclaw-napcat-plugin.git
 - `enableGroupMessages: true, groupMentionOnly: true`：只有 @ 机器人时才处理
 - `enableGroupMessages: true, groupMentionOnly: false`：处理所有群消息（不推荐）
 
-## NapCat 配置
+### 传输模式说明
+
+- `transport: "http"`：兼容原有 HTTP Server + HTTP Client 方式（默认推荐）
+- `transport: "ws-client"`：OpenClaw 主动连接 NapCat 的 WebSocket Server
+- `transport: "ws-server"`：OpenClaw 提供 WebSocket Server，NapCat 以 WebSocket Client 反向连接
+
+说明：
+- HTTP/WS 均支持 `token` 鉴权（同时发送 `Authorization: Bearer <token>` 与 `access_token` 查询参数）。
+- `wsReconnectMs` 仅 `ws-client` 使用；`ws-server` 模式无重连参数（由 NapCat 客户端负责重连）。
+
+## NapCat 配置（HTTP）
 
 在 NapCat 网络配置界面新建以下网络配置并启用：
 
@@ -92,6 +122,61 @@ Http 客户端
 - 消息格式: String
 
 如果 OpenClaw 运行在不同的机器上，请在 Http 客户端中使用实际 IP 地址。
+
+## NapCat 配置（WebSocket）
+
+### 方式 A：OpenClaw 使用 `ws-client`（连接 NapCat WS 服务器）
+
+NapCat 新建并启用 `Websocket 服务器`：
+- Host: `0.0.0.0`
+- Port: `3001`
+- Token: `napcat`（与 `wsToken` 对应）
+- 心跳间隔：建议 `30000`
+- 消息格式：建议 `Array`
+
+OpenClaw 示例：
+
+```json
+{
+  "channels": {
+    "napcat": {
+      "transport": "ws-client",
+      "wsUrl": "ws://1Panel-localnapcat-sGYW:3001/",
+      "wsToken": "napcat",
+      "wsHeartbeatMs": 30000,
+      "wsReconnectMs": 30000
+    }
+  }
+}
+```
+
+### 方式 B：OpenClaw 使用 `ws-server`（NapCat WS 客户端反向连接）
+
+NapCat 新建并启用 `Websocket 客户端`：
+- URL: `ws://<OpenClaw可达地址>:3001/`
+- Token: `napcat`（与 `wsToken` 对应）
+- 心跳间隔：建议 `30000`
+- 重连间隔：建议 `30000`
+- 消息格式：建议 `Array`
+
+OpenClaw 示例：
+
+```json
+{
+  "channels": {
+    "napcat": {
+      "transport": "ws-server",
+      "wsHost": "0.0.0.0",
+      "wsPort": 3001,
+      "wsPath": "/",
+      "wsToken": "napcat",
+      "wsHeartbeatMs": 30000
+    }
+  }
+}
+```
+
+两种方式都建议先确保容器间网络互通，再切换生产配置。
 
 ## 发送消息说明
 
@@ -150,7 +235,8 @@ openclaw-napcat-plugin/
 ├── src/
 │   ├── channel.ts        # 通道实现（发送消息）
 │   ├── runtime.ts        # 运行时状态管理
-│   └── webhook.ts        # HTTP 处理器（接收消息）
+│   ├── webhook.ts        # HTTP 入站处理（接收消息）
+│   └── ws.ts             # WebSocket 传输层（client/server）
 ```
 
 ## 许可证

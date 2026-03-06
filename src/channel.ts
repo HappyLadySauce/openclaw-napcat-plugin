@@ -1,5 +1,6 @@
 // Minimal NapCat Channel Implementation
 import { setNapCatConfig } from "./runtime.js";
+import { isWsTransport, sendNapCatActionOverWs } from "./ws.js";
 
 function appendAccessToken(rawUrl: string, token: string): string {
     const trimmedToken = String(token || "").trim();
@@ -30,6 +31,19 @@ async function sendToNapCat(url: string, payload: any, config: any) {
         throw new Error(`NapCat API Error: ${res.status} ${res.statusText}`);
     }
     return await res.json();
+}
+
+function endpointToAction(endpoint: string): string {
+    return endpoint.replace(/^\/+/, "").trim();
+}
+
+async function sendByConfiguredTransport(config: any, endpoint: string, payload: any) {
+    if (isWsTransport(config)) {
+        const action = endpointToAction(endpoint);
+        return sendNapCatActionOverWs(action, payload, Number(config.wsRequestTimeoutMs || 10000));
+    }
+    const baseUrl = config.url || "http://127.0.0.1:3000";
+    return sendToNapCat(`${baseUrl}${endpoint}`, payload, config);
 }
 
 function buildMediaProxyUrl(mediaUrl: string, config: any): string {
@@ -115,6 +129,61 @@ export const napcatPlugin = {
         type: "object",
         properties: {
             url: { type: "string", title: "NapCat HTTP URL", default: "http://127.0.0.1:3000" },
+            transport: {
+                type: "string",
+                title: "Transport",
+                description: "Transport mode: http, ws-client, ws-server",
+                default: "http",
+                enum: ["http", "ws-client", "ws-server"]
+            },
+            wsUrl: {
+                type: "string",
+                title: "NapCat WebSocket URL (client mode)",
+                description: "Used when transport=ws-client, e.g. ws://127.0.0.1:3001",
+                default: ""
+            },
+            wsHost: {
+                type: "string",
+                title: "WebSocket Host",
+                description: "Server bind host for ws-server mode, or fallback host for ws-client when wsUrl is empty",
+                default: "0.0.0.0"
+            },
+            wsPort: {
+                type: "number",
+                title: "WebSocket Port",
+                description: "Server bind port for ws-server mode, or fallback port for ws-client",
+                default: 3001
+            },
+            wsPath: {
+                type: "string",
+                title: "WebSocket Path",
+                description: "WebSocket path, e.g. /onebot/v11/ws",
+                default: "/"
+            },
+            wsToken: {
+                type: "string",
+                title: "WebSocket Token",
+                description: "Optional WS token (Authorization Bearer + access_token query)",
+                default: ""
+            },
+            wsHeartbeatMs: {
+                type: "number",
+                title: "WebSocket Heartbeat Interval (ms)",
+                description: "Heartbeat interval in milliseconds",
+                default: 30000
+            },
+            wsReconnectMs: {
+                type: "number",
+                title: "WebSocket Reconnect Interval (ms)",
+                description: "Reconnect interval for ws-client mode in milliseconds",
+                default: 30000
+            },
+            wsRequestTimeoutMs: {
+                type: "number",
+                title: "WebSocket Request Timeout (ms)",
+                description: "Timeout waiting action response in WS modes",
+                default: 10000
+            },
             agentId: {
                 type: "string",
                 title: "Fixed Agent ID",
@@ -203,8 +272,6 @@ export const napcatPlugin = {
         deliveryMode: "direct",
         sendText: async ({ to, text, cfg }: any) => {
             const config = cfg.channels?.napcat || {};
-            const baseUrl = config.url || "http://127.0.0.1:3000";
-            
             let targetType = "private";
             let targetId = to;
             
@@ -236,7 +303,7 @@ export const napcatPlugin = {
             console.log(`[NapCat] Sending to ${targetType} ${targetId}: ${text}`);
             
             try {
-                const result = await sendToNapCat(`${baseUrl}${endpoint}`, payload, config);
+                const result = await sendByConfiguredTransport(config, endpoint, payload);
                 return { ok: true, result };
             } catch (err: any) {
                 return { ok: false, error: err.message };
@@ -244,7 +311,6 @@ export const napcatPlugin = {
         },
         sendMedia: async ({ to, text, mediaUrl, cfg }: any) => {
             const config = cfg.channels?.napcat || {};
-            const baseUrl = config.url || "http://127.0.0.1:3000";
 
             let targetType = "private";
             let targetId = to;
@@ -280,7 +346,7 @@ export const napcatPlugin = {
             console.log(`[NapCat] Sending media to ${targetType} ${targetId}: ${message}`);
 
             try {
-                const result = await sendToNapCat(`${baseUrl}${endpoint}`, payload, config);
+                const result = await sendByConfiguredTransport(config, endpoint, payload);
                 return { ok: true, result };
             } catch (err: any) {
                 return { ok: false, error: err.message };
