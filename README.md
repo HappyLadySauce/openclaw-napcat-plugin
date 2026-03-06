@@ -56,6 +56,11 @@ git clone https://github.com/ProperSAMA/openclaw-napcat-plugin.git
       "wsRequestTimeoutMs": 10000,
       "actionTimeoutMs": 10000,
       "inboundMediaDir": "./workspace/napcat-inbound-media",
+      "inboundMediaAutoCleanupEnabled": true,
+      "inboundMediaTtlMs": 86400000,
+      "inboundMediaCleanupMinIntervalMs": 300000,
+      "streamTempAutoCleanupEnabled": true,
+      "streamTempAutoCleanupMode": "safe",
       "inboundImageEnabled": true,
       "inboundImagePreferUrl": true,
       "autoApproveFriendRequests": false,
@@ -114,6 +119,11 @@ git clone https://github.com/ProperSAMA/openclaw-napcat-plugin.git
 | `inboundImageEnabled` | boolean | 是否解析入站 CQ:image/CQ:record 为多模态输入 | `true` |
 | `inboundImagePreferUrl` | boolean | 解析图片时是否优先使用 CQ 中的 `url` 字段（否则优先 `file`） | `true` |
 | `inboundMediaDir` | string | 入站媒体本地缓存目录，插件会先下载到这里再交给 OpenClaw | `"./workspace/napcat-inbound-media"` |
+| `inboundMediaAutoCleanupEnabled` | boolean | 是否自动清理过期的入站媒体本地缓存 | `true` |
+| `inboundMediaTtlMs` | number | 入站媒体与 `context_*_id` 的保留时长（毫秒） | `86400000` |
+| `inboundMediaCleanupMinIntervalMs` | number | 两次本地缓存扫描之间的最小间隔（毫秒） | `300000` |
+| `streamTempAutoCleanupEnabled` | boolean | 是否在安全条件下自动清理 NapCat 流式临时目录 | `true` |
+| `streamTempAutoCleanupMode` | string | 流式临时目录自动清理模式：`off` / `safe` | `"safe"` |
 | `autoApproveFriendRequests` | boolean | 是否自动同意收到的好友申请 | `false` |
 | `friendAutoRemarkTemplate` | string | 自动同意好友申请时的备注模板，支持 `{userId}` / `{nickname}` / `{comment}` | `""` |
 | `friendRequestAllowUsers` | string[] | 自动同意好友申请的 QQ 白名单，空数组表示不限制 | `[]` |
@@ -203,26 +213,39 @@ OpenClaw 示例：
 
 两种方式都建议先确保容器间网络互通，再切换生产配置。
 
-## 入站图片识别说明
+## 入站媒体识别说明
 
-当 QQ 通过 NapCat 发送图片（`[CQ:image,...]`）或语音（`[CQ:record,...]`）时：
+当 QQ 通过 NapCat 发送图片（`[CQ:image,...]`）、语音（`[CQ:record,...]`）或视频（`[CQ:video,...]`）时：
 
 - 插件会在入站阶段解析 CQ 段：
   - 提取 `url` / `file`，生成图片/音频 URL 列表
   - 将纯文本中的图片 CQ 片段剥离，只保留用户正文
-- 为了兼容容器环境与远程模型取图限制，插件会优先把入站图片/语音下载到 OpenClaw 本地缓存目录，再通过 `MediaPath` / `MediaPaths` / `MediaType` / `MediaTypes` 交给 OpenClaw。
+- 为了兼容容器环境与远程模型取图限制，插件会优先把入站图片/语音/视频下载到 OpenClaw 本地缓存目录，再通过 `MediaPath` / `MediaPaths` / `MediaType` / `MediaTypes` 交给 OpenClaw。
+- 注入到上下文中的 `MediaPath` / `MediaPaths` 会优先使用工作区相对路径（例如 `./napcat-inbound-media/xxx.png`），避免把容器内绝对路径直接暴露给模型而触发本地路径访问限制。
 - 解析结果会注入到 OpenClaw 上下文中，例如：
   - `MediaUrls` / `MediaUrl`
   - `ImageUrls` / `Images`
+  - `AudioUrls` / `Audios`
+  - `VideoUrls` / `Videos`
   - `MediaPath` / `MediaPaths`
   - `MediaType` / `MediaTypes`
-  - `AudioUrls` / `Audios`
+  - `ImageContexts` / `AudioContexts` / `VideoContexts`
+  - `MediaContexts` / `MediaContextIds`
 - 上层 agent 会把这些媒体作为多模态输入交给模型，从而真正看到图片/语音，而不是只看到 `[CQ:image,...]` 这一串文本。
+
+自动清理说明：
+
+- 本地入站媒体缓存默认保留 `24h`，超时后会在后续入站处理或上下文读取时惰性清理。
+- 仍被 `context_*_id` 引用的本地文件不会被提前删除，避免上下文命中后出现 `ENOENT`。
+- 超过 TTL 后，对应 `context_image_id` / `context_audio_id` / `context_video_id` 也会一并过期，需要从新的消息上下文重新获取。
 
 相关配置：
 
 - `inboundImageEnabled`: 控制是否启用入站 CQ 媒体解析（默认启用）
 - `inboundImagePreferUrl`: 控制在 CQ 同时提供 `url` 和 `file` 时优先使用哪一个（默认优先 `url`）
+- `inboundMediaAutoCleanupEnabled`: 控制是否自动清理过期的本地缓存
+- `inboundMediaTtlMs`: 控制本地缓存和 `context_*_id` 的复用窗口
+- `inboundMediaCleanupMinIntervalMs`: 控制本地缓存扫描的最小间隔
 
 ## 发送消息说明
 
@@ -398,9 +421,9 @@ OpenClaw 示例：
 
 - `upload_file_stream` 分片阶段需要 JSON：`{"stream_id":"<stream_id>","chunk_data":"<base64>","chunk_index":0,"total_chunks":10,"file_size":12345,"expected_sha256":"<sha256>","filename":"big.bin"}`
 - `upload_file_stream` 完成阶段需要 JSON：`{"stream_id":"<stream_id>","is_complete":true}`
-- `download_file_stream` 需要 JSON：`{"file_id":"<file_id>"}` 或 `{"file":"<file>"}`，可选 `chunk_size`
-- `download_file_image_stream` 需要 JSON：`{"file_id":"<file_id>"}` 或 `{"file":"<file>"}`，可选 `chunk_size`
-- `download_file_record_stream` 需要 JSON：`{"file_id":"<file_id>"}` 或 `{"file":"<file>"}`，可选 `chunk_size`、`out_format`
+- `download_file_stream` 需要 JSON：`{"file_id":"<file_id>"}`、`{"file":"<file>"}`，或 `{"context_video_id":"<VideoContextId>"}` / `{"context_media_id":"<MediaContextId>"}`，可选 `chunk_size`
+- `download_file_image_stream` 需要 JSON：`{"file_id":"<file_id>"}`、`{"file":"<file>"}`，或 `{"context_image_id":"<ImageContextId>"}` / `{"context_media_id":"<MediaContextId>"}`，可选 `chunk_size`
+- `download_file_record_stream` 需要 JSON：`{"file_id":"<file_id>"}`、`{"file":"<file>"}`，或 `{"context_audio_id":"<AudioContextId>"}` / `{"context_media_id":"<MediaContextId>"}`，可选 `chunk_size`、`out_format`
 - `clean_stream_temp_file` 需要 JSON：`{}`
 
 说明：
@@ -409,23 +432,28 @@ OpenClaw 示例：
 - `upload_file_stream` 适用于大文件和跨设备部署，但需要外部先准备好分片后的 base64 数据与 SHA256。
 - `download_file_stream` 的官方参数是 `file` / `file_id` / `chunk_size`。插件会返回首段 `file_info`、后续 `file_chunk` 分段，以及最终 `file_complete` 汇总。
 - `download_file_image_stream` 与 `download_file_stream` 类似，但插件额外支持 `context_image_id`：当图片来自当前会话的入站消息上下文时，优先用这个稳定标识，不必依赖 NapCat 内部 UUID。普通 CQ 图片文件名或原始 URL 不一定能被 `resolveDownload()` 识别。
-- `download_file_record_stream` 与 `download_file_stream` 类似，但支持 `out_format` 转码，适合把语音流转换为 `mp3`、`wav`、`ogg` 等格式。
-- `clean_stream_temp_file` 的官方行为是清空 NapCat 流式传输临时目录，不是按单个 `stream_id` 精确删除，因此建议只在流式下载/上传完成且确认不再需要临时文件时调用。
+- `download_file_record_stream` 除了普通 `file_id` / `file` 外，还支持 `context_audio_id`，可直接复用本地语音缓存；若走本地上下文快捷路径，返回的是缓存文件流，不经过 NapCat 转码临时目录。
+- `download_file_stream` 还支持 `context_video_id` 与通用 `context_media_id`，适合复用当前消息中的本地视频缓存。
+- `clean_stream_temp_file` 的官方行为是清空 NapCat 流式传输临时目录，不是按单个 `stream_id` 精确删除。插件现在默认启用 `safe` 模式的保守自动清理，只会在流式下载/上传成功完成且当前没有并发流式任务时自动触发；手动调用仍然可用。
 
 建议工作流：
 
-1. 若是当前会话刚收到的图片，优先从上下文中的 `ImageContexts` / `ImageContextIds` 取稳定标识
-2. 用 `{"context_image_id":"<ImageContextId>"}` 调用 `action:download_file_image_stream`
-3. 若不是上下文图片，再通过 `get_group_root_files`、`get_group_files_by_folder`、`get_file` 等方式拿稳定的 `file_id` 或 `file`
-4. 根据文件类型调用 `action:download_file_stream`、`action:download_file_image_stream` 或 `action:download_file_record_stream`
-5. 消费返回中的 `stream_chunks`
-6. 确认文件不再需要后，再调用 `action:clean_stream_temp_file` 清理 NapCat 临时目录
+1. 若是当前会话刚收到的图片/语音/视频，优先从上下文中的 `ImageContexts` / `AudioContexts` / `VideoContexts` / `MediaContexts` 取稳定标识
+2. 图片优先用 `{"context_image_id":"<ImageContextId>"}` 调 `action:download_file_image_stream`
+3. 语音优先用 `{"context_audio_id":"<AudioContextId>"}` 调 `action:download_file_record_stream`
+4. 视频优先用 `{"context_video_id":"<VideoContextId>"}` 调 `action:download_file_stream`
+5. 若不是当前上下文媒体，再通过 `get_group_root_files`、`get_group_files_by_folder`、`get_file` 等方式拿稳定的 `file_id` 或 `file`
+6. 消费返回中的 `stream_chunks`
+7. 默认情况下，插件会在安全条件满足时自动调用 `clean_stream_temp_file`；只有需要人工兜底时，再手动调用 `action:clean_stream_temp_file`
 
-入站图片上下文字段：
+入站媒体上下文字段：
 
 - `ImageContextIds`: 当前消息提取到的稳定图片标识数组
 - `ImageContextId`: 第一张图片的稳定标识
 - `ImageContexts`: 详细数组，内含 `id`、`file`、`url`、`localPath`、`messageId`、`downloadTarget`、`downloadPayload`
+- `AudioContextIds` / `AudioContextId` / `AudioContexts`: 当前消息提取到的稳定语音标识
+- `VideoContextIds` / `VideoContextId` / `VideoContexts`: 当前消息提取到的稳定视频标识
+- `MediaContextIds` / `MediaContextId` / `MediaContexts`: 图片/语音/视频统一视图
 
 示例：
 

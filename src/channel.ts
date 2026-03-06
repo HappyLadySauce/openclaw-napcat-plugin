@@ -4,7 +4,7 @@ import { basename } from "node:path";
 import { stat } from "node:fs/promises";
 import { setNapCatConfig } from "./runtime.js";
 import { isWsTransport, sendNapCatActionOverWs } from "./ws.js";
-import { getInboundImageContext } from "./webhook.js";
+import { getInboundAudioContext, getInboundImageContext, getInboundMediaContext, getInboundVideoContext } from "./webhook.js";
 
 function appendAccessToken(rawUrl: string, token: string): string {
     const trimmedToken = String(token || "").trim();
@@ -56,6 +56,99 @@ async function callNapCatAction(config: any, action: string, payload: any = {}) 
         throw new Error("NapCat action is required");
     }
     return sendByConfiguredTransport(config, `/${normalizedAction}`, payload || {});
+}
+
+let activeStreamActionCount = 0;
+let pendingStreamTempCleanup: Promise<void> | null = null;
+
+function getStreamTempAutoCleanupMode(config: any): "off" | "safe" {
+    const normalized = String(config?.streamTempAutoCleanupMode || "safe").trim().toLowerCase();
+    return normalized === "safe" ? "safe" : "off";
+}
+
+function isStreamTempAutoCleanupEnabled(config: any): boolean {
+    return config?.streamTempAutoCleanupEnabled !== false && getStreamTempAutoCleanupMode(config) !== "off";
+}
+
+async function maybeAutoCleanStreamTemp(config: any, reason: string): Promise<void> {
+    if (!isStreamTempAutoCleanupEnabled(config)) {
+        return;
+    }
+    if (activeStreamActionCount !== 0) {
+        return;
+    }
+    if (pendingStreamTempCleanup) {
+        return pendingStreamTempCleanup;
+    }
+
+    pendingStreamTempCleanup = (async () => {
+        try {
+            await Promise.resolve();
+            if (activeStreamActionCount !== 0) {
+                return;
+            }
+            await callNapCatAction(config, "clean_stream_temp_file", {});
+            console.log(`[NapCat] Auto cleaned stream temp files after ${reason}`);
+        } catch (err) {
+            console.warn(`[NapCat] Auto clean_stream_temp_file failed after ${reason}:`, err);
+        } finally {
+            pendingStreamTempCleanup = null;
+        }
+    })();
+
+    return pendingStreamTempCleanup;
+}
+
+async function runTrackedStreamAction<T>(config: any, reason: string, runner: () => Promise<T>): Promise<T> {
+    if (!isStreamTempAutoCleanupEnabled(config)) {
+        return runner();
+    }
+
+    activeStreamActionCount += 1;
+    let success = false;
+    try {
+        const result = await runner();
+        success = true;
+        return result;
+    } finally {
+        activeStreamActionCount = Math.max(0, activeStreamActionCount - 1);
+        if (success) {
+            void maybeAutoCleanStreamTemp(config, reason);
+        }
+    }
+}
+
+function pickContextId(payload: Record<string, any>, ...keys: string[]): string {
+    for (const key of keys) {
+        const normalized = String(payload?.[key] ?? "").trim();
+        if (normalized) {
+            return normalized;
+        }
+    }
+    return "";
+}
+
+async function buildLocalContextStreamActionResult(
+    context: { id: string; type: string; localPath: string; file?: string },
+    options?: {
+        action?: string;
+        chunkSize?: number;
+        extraInfo?: Record<string, any>;
+    }
+) {
+    const extraInfo: Record<string, any> = {
+        source: `openclaw-inbound-${context.type}-context`,
+        context_media_id: context.id,
+        media_type: context.type,
+        ...(options?.extraInfo || {}),
+    };
+    extraInfo[`context_${context.type}_id`] = context.id;
+    return buildLocalStreamActionResult(context.localPath, {
+        action: options?.action,
+        chunkSize: options?.chunkSize,
+        fileName: context.file || undefined,
+        extraInfo,
+    });
 }
 
 function buildMediaProxyUrl(mediaUrl: string, config: any): string {
@@ -566,10 +659,10 @@ async function uploadFileStream(config: any, rawPayload: any) {
     const streamId = coerceNonEmptyString(payload.stream_id ?? payload.streamId, "stream_id");
     const isCompleteRaw = payload.is_complete ?? payload.isComplete;
     if (isCompleteRaw !== undefined && coerceBoolean(isCompleteRaw, "is_complete")) {
-        return callNapCatAction(config, "upload_file_stream", {
+        return runTrackedStreamAction(config, "upload_file_stream.complete", () => callNapCatAction(config, "upload_file_stream", {
             stream_id: streamId,
             is_complete: true,
-        });
+        }));
     }
 
     const requestPayload: Record<string, any> = {
@@ -590,52 +683,100 @@ async function uploadFileStream(config: any, rawPayload: any) {
 
 async function downloadFileStream(config: any, rawPayload: any) {
     const payload = requireObjectPayload(rawPayload, "download_file_stream");
-    const requestPayload = buildFileIdentityPayload(payload);
+    const contextVideoId = pickContextId(payload, "context_video_id", "contextVideoId", "video_context_id");
+    const contextMediaId = pickContextId(payload, "context_media_id", "contextMediaId", "media_context_id");
     const chunkSize = payload.chunk_size ?? payload.chunkSize;
-    if (chunkSize !== undefined) {
-        requestPayload.chunk_size = coerceInteger(chunkSize, "chunk_size");
+    const normalizedChunkSize = chunkSize !== undefined ? coerceInteger(chunkSize, "chunk_size") : undefined;
+
+    if (contextVideoId || contextMediaId) {
+        const context = contextVideoId
+            ? getInboundVideoContext(contextVideoId)
+            : getInboundMediaContext(contextMediaId);
+        const requestedId = contextVideoId || contextMediaId;
+        if (!context?.localPath) {
+            throw new Error(`未找到媒体上下文标识或已过期: ${requestedId}`);
+        }
+        if (contextVideoId && context.type !== "video") {
+            throw new Error(`上下文标识不是视频类型: ${requestedId}`);
+        }
+        return buildLocalContextStreamActionResult(context, {
+            action: "download_file_stream",
+            chunkSize: normalizedChunkSize,
+        });
     }
-    return callNapCatAction(config, "download_file_stream", requestPayload);
+
+    const requestPayload = buildFileIdentityPayload(payload);
+    if (normalizedChunkSize !== undefined) {
+        requestPayload.chunk_size = normalizedChunkSize;
+    }
+    return runTrackedStreamAction(config, "download_file_stream", () => callNapCatAction(config, "download_file_stream", requestPayload));
 }
 
 async function downloadFileImageStream(config: any, rawPayload: any) {
     const payload = requireObjectPayload(rawPayload, "download_file_image_stream");
-    const contextImageId = String(payload.context_image_id ?? payload.contextImageId ?? payload.image_context_id ?? "").trim();
+    const contextImageId = pickContextId(payload, "context_image_id", "contextImageId", "image_context_id");
+    const contextMediaId = pickContextId(payload, "context_media_id", "contextMediaId", "media_context_id");
     const chunkSize = payload.chunk_size ?? payload.chunkSize;
-    if (contextImageId) {
-        const context = getInboundImageContext(contextImageId);
+    const normalizedChunkSize = chunkSize !== undefined ? coerceInteger(chunkSize, "chunk_size") : undefined;
+    if (contextImageId || contextMediaId) {
+        const context = contextImageId
+            ? getInboundImageContext(contextImageId)
+            : getInboundMediaContext(contextMediaId);
+        const requestedId = contextImageId || contextMediaId;
         if (!context?.localPath) {
-            throw new Error(`未找到图片上下文标识: ${contextImageId}`);
+            throw new Error(`未找到图片上下文标识或已过期: ${requestedId}`);
         }
-        return buildLocalStreamActionResult(context.localPath, {
+        if (context.type !== "image") {
+            throw new Error(`上下文标识不是图片类型: ${requestedId}`);
+        }
+        return buildLocalContextStreamActionResult(context, {
             action: "download_file_image_stream",
-            chunkSize: chunkSize !== undefined ? coerceInteger(chunkSize, "chunk_size") : undefined,
-            fileName: context.file || undefined,
-            extraInfo: {
-                source: "openclaw-inbound-image-context",
-                context_image_id: context.id,
-            },
+            chunkSize: normalizedChunkSize,
         });
     }
     const requestPayload = buildFileIdentityPayload(payload);
-    if (chunkSize !== undefined) {
-        requestPayload.chunk_size = coerceInteger(chunkSize, "chunk_size");
+    if (normalizedChunkSize !== undefined) {
+        requestPayload.chunk_size = normalizedChunkSize;
     }
-    return callNapCatAction(config, "download_file_image_stream", requestPayload);
+    return runTrackedStreamAction(config, "download_file_image_stream", () => callNapCatAction(config, "download_file_image_stream", requestPayload));
 }
 
 async function downloadFileRecordStream(config: any, rawPayload: any) {
     const payload = requireObjectPayload(rawPayload, "download_file_record_stream");
-    const requestPayload = buildFileIdentityPayload(payload);
+    const contextAudioId = pickContextId(payload, "context_audio_id", "contextAudioId", "audio_context_id");
+    const contextMediaId = pickContextId(payload, "context_media_id", "contextMediaId", "media_context_id");
     const chunkSize = payload.chunk_size ?? payload.chunkSize;
-    if (chunkSize !== undefined) {
-        requestPayload.chunk_size = coerceInteger(chunkSize, "chunk_size");
-    }
     const outFormat = payload.out_format ?? payload.outFormat;
+    const normalizedChunkSize = chunkSize !== undefined ? coerceInteger(chunkSize, "chunk_size") : undefined;
+
+    if (contextAudioId || contextMediaId) {
+        const context = contextAudioId
+            ? getInboundAudioContext(contextAudioId)
+            : getInboundMediaContext(contextMediaId);
+        const requestedId = contextAudioId || contextMediaId;
+        if (!context?.localPath) {
+            throw new Error(`未找到语音上下文标识或已过期: ${requestedId}`);
+        }
+        if (context.type !== "audio") {
+            throw new Error(`上下文标识不是语音类型: ${requestedId}`);
+        }
+        return buildLocalContextStreamActionResult(context, {
+            action: "download_file_record_stream",
+            chunkSize: normalizedChunkSize,
+            extraInfo: outFormat !== undefined
+                ? { requested_out_format: coerceNonEmptyString(outFormat, "out_format") }
+                : undefined,
+        });
+    }
+
+    const requestPayload = buildFileIdentityPayload(payload);
+    if (normalizedChunkSize !== undefined) {
+        requestPayload.chunk_size = normalizedChunkSize;
+    }
     if (outFormat !== undefined) {
         requestPayload.out_format = coerceNonEmptyString(outFormat, "out_format");
     }
-    return callNapCatAction(config, "download_file_record_stream", requestPayload);
+    return runTrackedStreamAction(config, "download_file_record_stream", () => callNapCatAction(config, "download_file_record_stream", requestPayload));
 }
 
 async function cleanStreamTempFile(config: any, rawPayload: any) {
@@ -810,6 +951,37 @@ export const napcatPlugin = {
                 title: "Inbound Media Cache Directory",
                 description: "Directory used to cache inbound media files locally before passing to OpenClaw",
                 default: "./workspace/napcat-inbound-media"
+            },
+            inboundMediaAutoCleanupEnabled: {
+                type: "boolean",
+                title: "Enable Inbound Media Auto Cleanup",
+                description: "Automatically sweep expired inbound media files from the local cache directory",
+                default: true
+            },
+            inboundMediaTtlMs: {
+                type: "number",
+                title: "Inbound Media TTL (ms)",
+                description: "How long inbound media files and context IDs stay reusable before expiring",
+                default: 86400000
+            },
+            inboundMediaCleanupMinIntervalMs: {
+                type: "number",
+                title: "Inbound Media Cleanup Min Interval (ms)",
+                description: "Minimum delay between inbound media cache sweeps to avoid scanning on every message",
+                default: 300000
+            },
+            streamTempAutoCleanupEnabled: {
+                type: "boolean",
+                title: "Enable Stream Temp Auto Cleanup",
+                description: "Automatically clean NapCat stream temp files after successful stream actions when safe",
+                default: true
+            },
+            streamTempAutoCleanupMode: {
+                type: "string",
+                title: "Stream Temp Auto Cleanup Mode",
+                description: "Use safe mode to clean NapCat stream temp files only when no stream actions are still running",
+                default: "safe",
+                enum: ["off", "safe"]
             },
             agentId: {
                 type: "string",

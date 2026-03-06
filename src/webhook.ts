@@ -2,9 +2,10 @@ import { Agent as HttpAgent, request as httpRequest } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createReadStream } from "node:fs";
-import { appendFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { getNapCatRuntime, getNapCatConfig } from "./runtime.js";
 import { isWsTransport, sendNapCatActionOverWs } from "./ws.js";
 
@@ -396,10 +397,13 @@ function extractNapCatEvents(body: any): any[] {
     return [];
 }
 
+type InboundMediaType = "image" | "audio" | "video";
+
 interface ParsedMedia {
     text: string;
     imageUrls: string[];
     audioUrls: string[];
+    videoUrls: string[];
 }
 
 interface DownloadedMedia {
@@ -408,7 +412,8 @@ interface DownloadedMedia {
     records: Array<{ sourceUrl: string; path: string; type: string }>;
 }
 
-interface NapCatImageSegment {
+interface NapCatMediaSegment {
+    type: InboundMediaType;
     file: string;
     url: string;
     summary: string;
@@ -416,8 +421,9 @@ interface NapCatImageSegment {
     index: number;
 }
 
-interface InboundImageContext {
+interface InboundMediaContext {
     id: string;
+    type: InboundMediaType;
     createdAt: number;
     messageId: string;
     chatType: "group" | "direct";
@@ -432,42 +438,233 @@ interface InboundImageContext {
     localPath: string;
 }
 
-const inboundImageContextCache = new Map<string, InboundImageContext>();
-const inboundImageContextTtlMs = 24 * 60 * 60 * 1000;
+const inboundMediaContextCache = new Map<string, InboundMediaContext>();
+const defaultInboundMediaContextTtlMs = 24 * 60 * 60 * 1000;
+const defaultInboundMediaCleanupMinIntervalMs = 5 * 60 * 1000;
+let lastInboundMediaCleanupAt = 0;
+let pendingInboundMediaCleanup: Promise<void> | null = null;
 
-function cleanupInboundImageContexts(now = Date.now()) {
-    for (const [key, entry] of inboundImageContextCache) {
-        if (now - entry.createdAt > inboundImageContextTtlMs) {
-            inboundImageContextCache.delete(key);
+function coercePositiveInteger(value: any, fallback: number): number {
+    const normalized = Number(value);
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+        return fallback;
+    }
+    return Math.floor(normalized);
+}
+
+function isInboundMediaAutoCleanupEnabled(config: any): boolean {
+    return config?.inboundMediaAutoCleanupEnabled !== false;
+}
+
+function getInboundMediaContextTtlMs(config: any): number {
+    return coercePositiveInteger(config?.inboundMediaTtlMs, defaultInboundMediaContextTtlMs);
+}
+
+function getInboundMediaCleanupMinIntervalMs(config: any): number {
+    return coercePositiveInteger(config?.inboundMediaCleanupMinIntervalMs, defaultInboundMediaCleanupMinIntervalMs);
+}
+
+function cleanupExpiredInboundMediaContexts(config: any, now = Date.now()) {
+    const ttlMs = getInboundMediaContextTtlMs(config);
+    for (const [key, entry] of inboundMediaContextCache) {
+        if (now - entry.createdAt > ttlMs) {
+            inboundMediaContextCache.delete(key);
         }
     }
 }
 
-function buildInboundImageContextId(chatType: "group" | "direct", conversationId: string, messageId: string, sourceIndex: number): string {
-    const safeConversation = conversationId.replace(/[^a-zA-Z0-9:_-]/g, "_");
-    return `napcat-image:${chatType}:${safeConversation}:${messageId}:${sourceIndex}`;
+function getReferencedInboundMediaPaths(): Set<string> {
+    const referencedPaths = new Set<string>();
+    for (const entry of inboundMediaContextCache.values()) {
+        if (!entry.localPath) continue;
+        referencedPaths.add(resolve(entry.localPath));
+    }
+    return referencedPaths;
 }
 
-export function getInboundImageContext(id: string): InboundImageContext | null {
-    cleanupInboundImageContexts();
-    const entry = inboundImageContextCache.get(String(id || "").trim());
+async function cleanupInboundMediaFiles(config: any, force = false): Promise<void> {
+    cleanupExpiredInboundMediaContexts(config);
+    if (!isInboundMediaAutoCleanupEnabled(config)) {
+        return;
+    }
+
+    const now = Date.now();
+    const minIntervalMs = getInboundMediaCleanupMinIntervalMs(config);
+    if (!force && now - lastInboundMediaCleanupAt < minIntervalMs) {
+        return;
+    }
+    if (pendingInboundMediaCleanup) {
+        return pendingInboundMediaCleanup;
+    }
+
+    lastInboundMediaCleanupAt = now;
+    pendingInboundMediaCleanup = (async () => {
+        let deletedCount = 0;
+        try {
+            const mediaDir = getInboundMediaDir(config);
+            const entries = await readdir(mediaDir, { withFileTypes: true });
+            const ttlMs = getInboundMediaContextTtlMs(config);
+            const referencedPaths = getReferencedInboundMediaPaths();
+
+            for (const entry of entries) {
+                if (!entry.isFile()) continue;
+                const filePath = resolve(mediaDir, entry.name);
+                if (referencedPaths.has(filePath)) continue;
+
+                let fileStats;
+                try {
+                    fileStats = await stat(filePath);
+                } catch {
+                    continue;
+                }
+                if (!fileStats.isFile()) continue;
+                if (now - fileStats.mtimeMs < ttlMs) continue;
+
+                try {
+                    await rm(filePath, { force: true });
+                    deletedCount += 1;
+                } catch (err) {
+                    console.warn(`[NapCat] Failed to remove expired inbound media: ${filePath}`, err);
+                }
+            }
+        } catch (err: any) {
+            if (err?.code !== "ENOENT") {
+                console.warn("[NapCat] Failed to sweep inbound media cache:", err);
+            }
+        } finally {
+            pendingInboundMediaCleanup = null;
+        }
+
+        if (deletedCount > 0) {
+            console.log(`[NapCat] Removed expired inbound media files: ${deletedCount}`);
+        }
+    })();
+
+    return pendingInboundMediaCleanup;
+}
+
+function scheduleInboundMediaCleanup(config: any): void {
+    cleanupExpiredInboundMediaContexts(config);
+    void cleanupInboundMediaFiles(config).catch((err) => {
+        console.warn("[NapCat] Inbound media cleanup task failed:", err);
+    });
+}
+
+function buildInboundMediaContextId(type: InboundMediaType, chatType: "group" | "direct", conversationId: string, messageId: string, sourceIndex: number): string {
+    const safeConversation = conversationId.replace(/[^a-zA-Z0-9:_-]/g, "_");
+    return `napcat-${type}:${chatType}:${safeConversation}:${messageId}:${sourceIndex}`;
+}
+
+export function getInboundMediaContext(id: string): InboundMediaContext | null {
+    const config = getNapCatConfig();
+    cleanupExpiredInboundMediaContexts(config);
+    scheduleInboundMediaCleanup(config);
+    const entry = inboundMediaContextCache.get(String(id || "").trim());
     return entry || null;
 }
 
-function extractNapCatImageSegments(event: any): NapCatImageSegment[] {
+export function getInboundImageContext(id: string): InboundMediaContext | null {
+    const entry = getInboundMediaContext(id);
+    return entry?.type === "image" ? entry : null;
+}
+
+export function getInboundAudioContext(id: string): InboundMediaContext | null {
+    const entry = getInboundMediaContext(id);
+    return entry?.type === "audio" ? entry : null;
+}
+
+export function getInboundVideoContext(id: string): InboundMediaContext | null {
+    const entry = getInboundMediaContext(id);
+    return entry?.type === "video" ? entry : null;
+}
+
+function extractNapCatMediaSegments(event: any, type: InboundMediaType): NapCatMediaSegment[] {
     const segments = Array.isArray(event?.message) ? event.message : [];
-    const results: NapCatImageSegment[] = [];
+    const targetSegmentType = type === "audio" ? "record" : type;
+    const results: NapCatMediaSegment[] = [];
     let index = 0;
     for (const segment of segments) {
-        if (!segment || segment.type !== "image" || typeof segment.data !== "object") continue;
+        if (!segment || segment.type !== targetSegmentType || typeof segment.data !== "object") continue;
         const file = decodeHtmlEntities(String(segment.data.file || "").trim());
         const url = decodeHtmlEntities(String(segment.data.url || "").trim());
-        const summary = String(segment.data.summary || "").trim();
-        const fileSize = String(segment.data.file_size || segment.data.fileSize || "").trim();
-        results.push({ file, url, summary, fileSize, index });
+        const summary = String(segment.data.summary || segment.data.name || "").trim();
+        const fileSize = String(segment.data.file_size || segment.data.fileSize || segment.data.size || "").trim();
+        results.push({ type, file, url, summary, fileSize, index });
         index++;
     }
     return results;
+}
+
+function buildInboundMediaContexts(
+    type: InboundMediaType,
+    segments: NapCatMediaSegment[],
+    records: DownloadedMedia["records"],
+    base: {
+        messageId: string;
+        chatType: "group" | "direct";
+        conversationId: string;
+        senderId: string;
+        groupId?: string;
+    }
+): InboundMediaContext[] {
+    const downloadedByUrl = new Map(records.map((record) => [record.sourceUrl, record]));
+    const contexts: InboundMediaContext[] = [];
+    for (const segment of segments) {
+        const sourceUrl = segment.url || segment.file;
+        const downloaded = downloadedByUrl.get(sourceUrl);
+        if (!downloaded?.path) continue;
+
+        const context: InboundMediaContext = {
+            id: buildInboundMediaContextId(type, base.chatType, base.conversationId, base.messageId, segment.index),
+            type,
+            createdAt: Date.now(),
+            messageId: base.messageId,
+            chatType: base.chatType,
+            conversationId: base.conversationId,
+            senderId: base.senderId,
+            groupId: base.groupId,
+            sourceIndex: segment.index,
+            file: segment.file,
+            url: segment.url,
+            summary: segment.summary,
+            fileSize: segment.fileSize,
+            localPath: downloaded.path,
+        };
+        inboundMediaContextCache.set(context.id, context);
+        contexts.push(context);
+    }
+    return contexts;
+}
+
+function buildMediaContextPayload(context: InboundMediaContext) {
+    let downloadTarget = "action:download_file_stream";
+    let downloadPayload: Record<string, any> = { context_media_id: context.id };
+    if (context.type === "image") {
+        downloadTarget = "action:download_file_image_stream";
+        downloadPayload = { context_image_id: context.id };
+    } else if (context.type === "audio") {
+        downloadTarget = "action:download_file_record_stream";
+        downloadPayload = { context_audio_id: context.id };
+    } else if (context.type === "video") {
+        downloadTarget = "action:download_file_stream";
+        downloadPayload = { context_video_id: context.id };
+    }
+
+    return {
+        id: context.id,
+        type: context.type,
+        url: context.url,
+        file: context.file,
+        summary: context.summary,
+        fileSize: context.fileSize,
+        localPath: context.localPath,
+        messageId: context.messageId,
+        chatType: context.chatType,
+        conversationId: context.conversationId,
+        sourceIndex: context.sourceIndex,
+        downloadTarget,
+        downloadPayload,
+    };
 }
 
 function decodeHtmlEntities(input: string): string {
@@ -482,11 +679,12 @@ function decodeHtmlEntities(input: string): string {
 function parseCqMedia(rawText: string, config: any): ParsedMedia {
     const inboundImageEnabled = config.inboundImageEnabled !== false;
     if (!inboundImageEnabled || !rawText || typeof rawText !== "string") {
-        return { text: rawText || "", imageUrls: [], audioUrls: [] };
+        return { text: rawText || "", imageUrls: [], audioUrls: [], videoUrls: [] };
     }
 
     const imageUrls: string[] = [];
     const audioUrls: string[] = [];
+    const videoUrls: string[] = [];
 
     const cqRegex = /\[CQ:([a-zA-Z0-9_]+)([^\]]*)\]/g;
     let clean = "";
@@ -526,6 +724,11 @@ function parseCqMedia(rawText: string, config: any): ParsedMedia {
             if (url) {
                 audioUrls.push(url);
             }
+        } else if (type === "video") {
+            const url = decodeHtmlEntities(String(kv.url || kv.file || "").trim());
+            if (url) {
+                videoUrls.push(url);
+            }
         } else {
             // 保留非媒体 CQ 段（例如 @ 提醒等）
             clean += match[0];
@@ -535,20 +738,49 @@ function parseCqMedia(rawText: string, config: any): ParsedMedia {
     clean += rawText.slice(lastIndex);
     const normalizedText = clean.trim();
 
-    if (imageUrls.length > 0 || audioUrls.length > 0) {
-        console.log(`[NapCat] Parsed media from message: images=${imageUrls.length}, audios=${audioUrls.length}`);
+    if (imageUrls.length > 0 || audioUrls.length > 0 || videoUrls.length > 0) {
+        console.log(`[NapCat] Parsed media from message: images=${imageUrls.length}, audios=${audioUrls.length}, videos=${videoUrls.length}`);
     }
 
     return {
         text: normalizedText,
         imageUrls,
         audioUrls,
+        videoUrls,
     };
 }
 
 function getInboundMediaDir(config: any): string {
     const baseDirRaw = String(config.inboundMediaDir || "./workspace/napcat-inbound-media").trim() || "./workspace/napcat-inbound-media";
+    if (baseDirRaw.startsWith("./workspace/")) {
+        const relativeDir = baseDirRaw.slice("./workspace/".length).replace(/^\/+/, "");
+        return resolve(homedir(), ".openclaw", "workspace", relativeDir);
+    }
+    if (baseDirRaw === "./workspace") {
+        return resolve(homedir(), ".openclaw", "workspace");
+    }
     return resolve(baseDirRaw);
+}
+
+function toWorkspaceRelativeMediaPath(filePath: string, config: any): string {
+    const absolutePath = resolve(String(filePath || ""));
+    const baseDirRaw = String(config?.inboundMediaDir || "./workspace/napcat-inbound-media").trim() || "./workspace/napcat-inbound-media";
+    const normalizedBaseRaw = baseDirRaw.replace(/\\/g, "/");
+    const fileName = basename(absolutePath);
+
+    if (normalizedBaseRaw.startsWith("./workspace/")) {
+        const relativeDir = normalizedBaseRaw.slice("./workspace/".length).replace(/^\/+/, "").replace(/\/+$/, "");
+        return relativeDir ? `./${relativeDir}/${fileName}` : `./${fileName}`;
+    }
+
+    const workspaceMarker = "/workspace/";
+    const normalizedAbsolute = absolutePath.replace(/\\/g, "/");
+    const markerIndex = normalizedAbsolute.indexOf(workspaceMarker);
+    if (markerIndex >= 0) {
+        return `./${normalizedAbsolute.slice(markerIndex + workspaceMarker.length)}`;
+    }
+
+    return `./${fileName}`;
 }
 
 function extFromContentType(contentType: string): string {
@@ -560,6 +792,11 @@ function extFromContentType(contentType: string): string {
     if (normalized.includes("audio/wav")) return ".wav";
     if (normalized.includes("audio/mpeg")) return ".mp3";
     if (normalized.includes("audio/ogg")) return ".ogg";
+    if (normalized.includes("audio/mp4") || normalized.includes("audio/x-m4a")) return ".m4a";
+    if (normalized.includes("video/mp4")) return ".mp4";
+    if (normalized.includes("video/webm")) return ".webm";
+    if (normalized.includes("video/quicktime")) return ".mov";
+    if (normalized.includes("video/x-msvideo")) return ".avi";
     return "";
 }
 
@@ -567,10 +804,11 @@ function normalizeInboundMediaType(contentType: string): string {
     const normalized = String(contentType || "").toLowerCase();
     if (normalized.startsWith("image/")) return "image";
     if (normalized.startsWith("audio/")) return "audio";
+    if (normalized.startsWith("video/")) return "video";
     return normalized || "file";
 }
 
-async function downloadInboundMedia(urls: string[], kind: "image" | "audio", config: any): Promise<DownloadedMedia> {
+async function downloadInboundMedia(urls: string[], kind: InboundMediaType, config: any): Promise<DownloadedMedia> {
     const result: DownloadedMedia = { paths: [], types: [], records: [] };
     if (!Array.isArray(urls) || urls.length === 0) return result;
 
@@ -589,12 +827,14 @@ async function downloadInboundMedia(urls: string[], kind: "image" | "audio", con
             }
 
             const contentType = response.headers.get("content-type") || (kind === "image" ? "image/png" : "application/octet-stream");
-            const ext = extFromContentType(contentType) || extname(new URL(mediaUrl).pathname) || (kind === "image" ? ".img" : ".bin");
+            const fallbackExt = kind === "image" ? ".img" : (kind === "audio" ? ".bin" : ".mp4");
+            const ext = extFromContentType(contentType) || extname(new URL(mediaUrl).pathname) || fallbackExt;
             const filePath = resolve(mediaDir, `${Date.now()}-${randomUUID()}${ext}`);
             const buffer = Buffer.from(await response.arrayBuffer());
             await writeFile(filePath, buffer);
             result.paths.push(filePath);
-            const normalizedType = normalizeInboundMediaType(contentType);
+            const detectedType = normalizeInboundMediaType(contentType);
+            const normalizedType = detectedType === "file" ? kind : detectedType;
             result.types.push(normalizedType);
             result.records.push({ sourceUrl: mediaUrl, path: filePath, type: normalizedType });
         } catch (err) {
@@ -803,39 +1043,27 @@ async function handleNapCatMessageEvent(event: any, config: any): Promise<void> 
     route.agentId = effectiveAgentId;
     route.sessionKey = sessionKey;
 
+    await cleanupInboundMediaFiles(config);
     const parsedMedia = parseCqMedia(text, config);
     const mediaImageUrls = parsedMedia.imageUrls || [];
     const mediaAudioUrls = parsedMedia.audioUrls || [];
+    const mediaVideoUrls = parsedMedia.videoUrls || [];
     const finalText = parsedMedia.text || text;
     const downloadedImages = await downloadInboundMedia(mediaImageUrls, "image", config);
     const downloadedAudios = await downloadInboundMedia(mediaAudioUrls, "audio", config);
-    const imageSegments = extractNapCatImageSegments(event);
-    const downloadedImageByUrl = new Map(downloadedImages.records.map((record) => [record.sourceUrl, record]));
-    const imageContexts: InboundImageContext[] = [];
-    cleanupInboundImageContexts();
-    for (const segment of imageSegments) {
-        const sourceUrl = segment.url || segment.file;
-        const downloaded = downloadedImageByUrl.get(sourceUrl);
-        if (!downloaded?.path) continue;
-        const contextId = buildInboundImageContextId(isGroup ? "group" : "direct", conversationId, messageId, segment.index);
-        const context: InboundImageContext = {
-            id: contextId,
-            createdAt: Date.now(),
-            messageId,
-            chatType: isGroup ? "group" : "direct",
-            conversationId,
-            senderId,
-            groupId: isGroup ? String(event.group_id) : undefined,
-            sourceIndex: segment.index,
-            file: segment.file,
-            url: segment.url,
-            summary: segment.summary,
-            fileSize: segment.fileSize,
-            localPath: downloaded.path,
-        };
-        inboundImageContextCache.set(contextId, context);
-        imageContexts.push(context);
-    }
+    const downloadedVideos = await downloadInboundMedia(mediaVideoUrls, "video", config);
+    const chatType: "group" | "direct" = isGroup ? "group" : "direct";
+    const contextBase = {
+        messageId,
+        chatType,
+        conversationId,
+        senderId,
+        groupId: isGroup ? String(event.group_id) : undefined,
+    };
+    const imageContexts = buildInboundMediaContexts("image", extractNapCatMediaSegments(event, "image"), downloadedImages.records, contextBase);
+    const audioContexts = buildInboundMediaContexts("audio", extractNapCatMediaSegments(event, "audio"), downloadedAudios.records, contextBase);
+    const videoContexts = buildInboundMediaContexts("video", extractNapCatMediaSegments(event, "video"), downloadedVideos.records, contextBase);
+    const allMediaContexts = [...imageContexts, ...audioContexts, ...videoContexts];
 
     const ctxPayload: any = {
         Body: finalText,
@@ -876,6 +1104,7 @@ async function handleNapCatMessageEvent(event: any, config: any): Promise<void> 
                 url,
                 file: context.file,
                 contextImageId: context.id,
+                contextMediaId: context.id,
                 localPath: context.localPath,
             } : { type: "image", url };
         });
@@ -884,30 +1113,59 @@ async function handleNapCatMessageEvent(event: any, config: any): Promise<void> 
     if (imageContexts.length > 0) {
         ctxPayload.ImageContextIds = imageContexts.map((item) => item.id);
         ctxPayload.ImageContextId = imageContexts[0].id;
-        ctxPayload.ImageContexts = imageContexts.map((item) => ({
-            id: item.id,
-            type: "image",
-            url: item.url,
-            file: item.file,
-            summary: item.summary,
-            fileSize: item.fileSize,
-            localPath: item.localPath,
-            messageId: item.messageId,
-            chatType: item.chatType,
-            conversationId: item.conversationId,
-            sourceIndex: item.sourceIndex,
-            downloadTarget: "action:download_file_image_stream",
-            downloadPayload: { context_image_id: item.id },
-        }));
+        ctxPayload.ImageContexts = imageContexts.map((item) => buildMediaContextPayload(item));
     }
 
     if (mediaAudioUrls.length > 0) {
         ctxPayload.AudioUrls = mediaAudioUrls;
-        ctxPayload.Audios = mediaAudioUrls.map((url: string) => ({ type: "audio", url }));
+        ctxPayload.Audios = mediaAudioUrls.map((url: string, index: number) => {
+            const context = audioContexts.find((item) => item.sourceIndex === index);
+            return context ? {
+                type: "audio",
+                url,
+                file: context.file,
+                contextAudioId: context.id,
+                contextMediaId: context.id,
+                localPath: context.localPath,
+            } : { type: "audio", url };
+        });
     }
 
-    const mediaPaths = [...downloadedImages.paths, ...downloadedAudios.paths];
-    const mediaTypes = [...downloadedImages.types, ...downloadedAudios.types];
+    if (audioContexts.length > 0) {
+        ctxPayload.AudioContextIds = audioContexts.map((item) => item.id);
+        ctxPayload.AudioContextId = audioContexts[0].id;
+        ctxPayload.AudioContexts = audioContexts.map((item) => buildMediaContextPayload(item));
+    }
+
+    if (mediaVideoUrls.length > 0) {
+        ctxPayload.VideoUrls = mediaVideoUrls;
+        ctxPayload.Videos = mediaVideoUrls.map((url: string, index: number) => {
+            const context = videoContexts.find((item) => item.sourceIndex === index);
+            return context ? {
+                type: "video",
+                url,
+                file: context.file,
+                contextVideoId: context.id,
+                contextMediaId: context.id,
+                localPath: context.localPath,
+            } : { type: "video", url };
+        });
+    }
+
+    if (videoContexts.length > 0) {
+        ctxPayload.VideoContextIds = videoContexts.map((item) => item.id);
+        ctxPayload.VideoContextId = videoContexts[0].id;
+        ctxPayload.VideoContexts = videoContexts.map((item) => buildMediaContextPayload(item));
+    }
+
+    if (allMediaContexts.length > 0) {
+        ctxPayload.MediaContextIds = allMediaContexts.map((item) => item.id);
+        ctxPayload.MediaContextId = allMediaContexts[0].id;
+        ctxPayload.MediaContexts = allMediaContexts.map((item) => buildMediaContextPayload(item));
+    }
+
+    const mediaPaths = [...downloadedImages.paths, ...downloadedAudios.paths, ...downloadedVideos.paths].map((filePath) => toWorkspaceRelativeMediaPath(filePath, config));
+    const mediaTypes = [...downloadedImages.types, ...downloadedAudios.types, ...downloadedVideos.types];
     if (mediaPaths.length > 0) {
         ctxPayload.MediaPaths = mediaPaths;
         ctxPayload.MediaPath = mediaPaths[0];
