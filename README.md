@@ -33,6 +33,32 @@ git clone https://github.com/ProperSAMA/openclaw-napcat-plugin.git
 4. 按需求修改配置文件 `openclaw.json`
 5. 重启 OpenClaw Gateway: `openclaw gateway restart`
 
+## 源码结构
+
+重构后的 `src/` 目录按“入口层 + 共享模块 + 领域模块”组织，后续继续扩展接口时建议优先复用 barrel 入口：
+
+- `src/channel.ts`：NapCat channel 入口，保留插件声明、配置接入、`sendText`、`sendMedia`
+- `src/webhook.ts`：NapCat webhook 入口，保留 HTTP 入口、事件分发、兼容导出
+- `src/index.ts`：共享模块 barrel，统一导出 target、transport、message format、action params、媒体上下文、日志、消息事件等公共能力
+- `src/actions/index.ts`：action handler barrel，统一导出 `friend` / `group` / `system` / `file` / `stream` handlers
+- `src/runtime.ts`：插件运行时与当前 channel 配置的全局访问入口
+- `src/ws.ts`：NapCat WebSocket transport、连接管理、心跳、`stream-action` 聚合
+- `src/napcat-transport.ts`：HTTP/WS 发送、token 注入、通用 `callNapCatAction`
+- `src/napcat-message-format.ts`：CQ 媒体格式化、媒体代理 URL、回复消息拼装
+- `src/napcat-media-context-store.ts`：`context_*_id`、TTL、本地缓存清理
+- `src/napcat-inbound-media.ts`：CQ 媒体解析、本地下载、上下文构建
+- `src/napcat-message-event.ts`：入站消息主流程、session 路由、多模态上下文注入、reply dispatcher
+- `src/napcat-friend-request.ts`：好友申请日志与自动处理
+- `src/napcat-media-proxy.ts`：`/napcat/media` 代理处理
+- `src/napcat-inbound-log.ts`：入站日志与 parse-error 日志
+
+维护约定：
+
+- 入口文件优先从 `src/index.ts` 或 `src/actions/index.ts` 导入，减少零散相对路径
+- `runtime.ts` 与 `ws.ts` 也已经纳入 `src/index.ts` 统一导出；上层编排模块可直接经由 barrel 使用
+- 叶子模块尽量直接依赖具体文件，避免从总 barrel 反向导入导致循环依赖
+- 若新增 NapCat action，优先放到 `src/actions/` 下对应领域文件，再由 `src/actions/index.ts` 和 `src/napcat-action-dispatch.ts` 注册
+
 ## 配置方法
 
 在 `~/.openclaw/openclaw.json` 中添加或修改 `channels.napcat` 配置：
